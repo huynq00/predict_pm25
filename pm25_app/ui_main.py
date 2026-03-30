@@ -10,6 +10,9 @@ import streamlit.components.v1 as components
 
 from pm25_app.config import BASE_DIR, FORECAST_CACHE_FILE, FORECAST_CACHE_META
 from pm25_app.env_utils import load_env_file
+from pm25_app.health_recommendations_card import parse_llm_bullets, render_health_recommendations_card
+from pm25_app.hourly_strip import render_hourly_forecast_strip
+from pm25_app.precompute_trigger import run_precompute_locked, should_trigger_precompute
 from timemoe_pm25_pipeline import CONTEXT_LEN, PRED_LEN, pm25_aqi_band_vn
 
 
@@ -46,10 +49,15 @@ def schedule_auto_refresh(minutes: int = 60) -> None:
     )
 
 
-def load_forecast_cache() -> tuple[pd.DataFrame | None, pd.DataFrame | None, dict | None]:
-    if not FORECAST_CACHE_FILE.is_file() or not FORECAST_CACHE_META.is_file():
-        return None, None, None
-
+def load_forecast_cache() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    if not FORECAST_CACHE_FILE.is_file():
+        raise FileNotFoundError(
+            f"Thiếu {FORECAST_CACHE_FILE}. Chạy `python precompute_forecast.py --once` trong thư mục streamlit_app."
+        )
+    if not FORECAST_CACHE_META.is_file():
+        raise FileNotFoundError(
+            f"Thiếu {FORECAST_CACHE_META}. Chạy `python precompute_forecast.py --once` trong thư mục streamlit_app."
+        )
     try:
         raw_df = pd.read_csv(FORECAST_CACHE_FILE)
         raw_df["Thời gian"] = pd.to_datetime(raw_df["Thời gian"])
@@ -57,9 +65,9 @@ def load_forecast_cache() -> tuple[pd.DataFrame | None, pd.DataFrame | None, dic
             ["Thời gian", "PM2.5 (μg/m³)"]
         ]
         meta = json.loads(FORECAST_CACHE_META.read_text(encoding="utf-8"))
-        return fc_df, raw_df, meta
-    except Exception:
-        return None, None, None
+    except Exception as e:
+        raise RuntimeError(f"Không đọc hoặc không parse được cache dự báo: {e}") from e
+    return fc_df, raw_df, meta
 
 
 def render_forecast_chart(fc_df: pd.DataFrame) -> None:
@@ -138,20 +146,26 @@ def render_warning_recommendations(fc_df: pd.DataFrame, llm_text: str | None = N
     else:
         st.success("Mức dự báo không quá cao trong 24h tới.")
 
-    if llm_text and not llm_text.startswith("(LLM precompute lỗi:"):
-        st.markdown(
-            "<div class='app-card'><h4>Khuyến nghị từ LLM (precompute)</h4>"
-            "<div class='small-muted'>Sinh trước trên server/cron; trang web chỉ hiển thị.</div></div>",
-            unsafe_allow_html=True,
+    llm_err_old = bool(llm_text and llm_text.startswith("(LLM precompute lỗi:"))
+    if llm_err_old:
+        st.error(
+            f"Cache chứa lỗi LLM cũ. Xóa `artifacts/` và chạy lại precompute. {llm_text}"
         )
-        st.markdown(llm_text)
-    elif llm_text and llm_text.startswith("(LLM precompute lỗi:"):
-        st.error(llm_text)
-    else:
-        st.info(
-            "Chưa có khuyến nghị LLM trong cache. "
-            "Chạy `precompute_forecast.py` với API key trong `.env` để sinh trước."
+    elif not (llm_text and llm_text.strip()):
+        st.error(
+            "Cache không có khuyến nghị LLM (`llm_text` rỗng). "
+            "Cấu hình GEMINI_API_KEY / LLM_API_KEY trong `.env` rồi chạy lại precompute."
         )
+
+    render_health_recommendations_card(
+        peak_pm25=peak_val,
+        llm_text=llm_text if not llm_err_old else None,
+        llm_error=llm_err_old,
+    )
+
+    if llm_text and llm_text.strip() and not llm_err_old and not parse_llm_bullets(llm_text):
+        with st.expander("Văn bản đầy đủ từ LLM"):
+            st.markdown(llm_text)
 
     high_df = fc_df[fc_df["PM2.5 (μg/m³)"] >= max(35.0, avg24)]
     if len(high_df) > 0:
@@ -173,34 +187,48 @@ def main() -> None:
 
     st.title("Dự báo chất lượng không khí — PM2.5 (TP.HCM)")
     st.caption(
-        f"Chỉ hiển thị kết quả đã tính trước (ngữ cảnh {CONTEXT_LEN} giờ, dự báo {PRED_LEN} giờ). "
-        "Không chạy mô hình trên trình duyệt."
+        f"Ngữ cảnh {CONTEXT_LEN} giờ, dự báo {PRED_LEN} giờ. "
+        "Precompute (Open-Meteo + Time-MoE + LLM) chạy **trên máy chủ Streamlit**, không chạy trong trình duyệt."
     )
-
-    fc_df, cache_raw_df, cache_meta = load_forecast_cache()
-    if fc_df is None or cache_raw_df is None or cache_meta is None:
-        st.error(
-            "Chưa có dữ liệu dự báo trong `artifacts/`. "
-            "Trên máy chủ, chạy: `python precompute_forecast.py --once` trong thư mục `streamlit_app`."
-        )
-        st.stop()
 
     with st.sidebar:
         st.header("Trang xem nhanh")
         refresh_minutes = st.number_input(
-            "Tự làm mới trang (phút)",
+            "Chu kỳ làm mới dự báo + tải lại trang (phút)",
             min_value=15,
             max_value=180,
             value=60,
             step=15,
-            help="Chỉ tải lại trang để lấy file cache mới sau khi precompute cập nhật.",
+            key="pm25_refresh_minutes",
+            help="Mỗi lần tải trang: nếu chưa có cache hoặc cache cũ hơn số phút này thì chạy precompute trên server. Trình duyệt tự reload sau cùng khoảng thời gian để kiểm tra lại.",
         )
         st.caption(
-            "Dự báo được cập nhật bởi tiến trình `precompute_forecast` (cron/systemd), không phải bởi mỗi lần mở web."
+            "Có thể vẫn chạy `python precompute_forecast.py` từ terminal hoặc cron nếu muốn cập nhật khi không ai mở web."
         )
 
+    if should_trigger_precompute(int(refresh_minutes)):
+        with st.spinner(
+            "Đang cập nhật dự báo trên server (Open-Meteo, Time-MoE, LLM) — có thể vài phút..."
+        ):
+            outcome, err = run_precompute_locked(160)
+        if outcome == "error" and err:
+            st.error(f"Precompute thất bại: {err}")
+        elif outcome == "busy":
+            st.info("Đang có tiến trình precompute khác (tab hoặc user khác) — tạm hiển thị cache hiện có.")
+
+    try:
+        fc_df, cache_raw_df, cache_meta = load_forecast_cache()
+    except FileNotFoundError as e:
+        st.error(str(e))
+        st.stop()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
     schedule_auto_refresh(int(refresh_minutes))
-    st.caption(f"Tự động làm mới trang mỗi {int(refresh_minutes)} phút (để thấy cache mới nếu có).")
+    st.caption(
+        f"Tự động tải lại trang mỗi {int(refresh_minutes)} phút; sau mỗi lần tải lại, server sẽ precompute lại nếu cache đã cũ hơn cùng số phút."
+    )
 
     now_ts = pd.Timestamp.utcnow()
     gen_at = cache_meta.get("generated_at_utc", "unknown")
@@ -215,11 +243,14 @@ def main() -> None:
         st.success(f"Cache còn mới (generated_at={gen_at} UTC).")
     else:
         st.warning(
-            f"Đang hiển thị cache đã lưu (generated_at={gen_at} UTC). "
-            "Nếu cần số mới, chạy lại precompute trên server."
+            f"Cache đã lưu (generated_at={gen_at} UTC). Lần tải trang tiếp theo sẽ precompute lại khi đã quá {int(refresh_minutes)} phút (hoặc dùng nút rerun / reload trình duyệt sau khi đủ thời gian)."
         )
 
     st.subheader("Thông tin lần tính gần nhất")
+    st.caption(
+        f"**Chế độ dữ liệu (cache):** `{cache_meta.get('data_mode', 'historical')}` — "
+        "dự báo realtime: đặt `PM25_DATA_MODE=realtime` trong `.env`, rồi để trang precompute lại (hoặc `precompute_forecast.py --once`)."
+    )
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Quan sát cuối (dataset)", str(cache_meta.get("dataset_last_time", "—")))
     model_id = str(cache_meta.get("model_id", "—"))
@@ -232,12 +263,28 @@ def main() -> None:
     st.caption(
         "Toàn bộ đường cong và bảng bên dưới đọc từ `artifacts/latest_forecast*.csv/json` — không suy luận trên web."
     )
+    st.caption(
+        "Kết quả đọc từ `artifacts/latest_forecast*.csv/json` sau mỗi lần precompute (tự chạy khi mở tab hoặc khi cache cũ). "
+        "Vẫn có thể chạy tay: `python precompute_forecast.py --once`."
+    )
+    _dm = str(cache_meta.get("data_mode", "historical")).lower()
+    if _dm == "realtime":
+        st.caption(
+            "Chế độ **realtime** (`PM25_DATA_MODE=realtime` trong `.env`): quan sát cuối gần **hiện tại** (API cắt tại giờ đã khóa, thường now−1h); "
+            "24 mốc trên biểu đồ là **24 giờ tiếp theo** sau quan sát đó. `generated_at` là lúc chạy precompute (UTC)."
+        )
+    else:
+        st.caption(
+            "Chế độ **historical** (mặc định): dataset Open-Meteo tới **31/12/2025**; trục dự báo là **24 giờ liên tục** ngay sau quan sát cuối "
+            "(vd. quan sát cuối 31/12/2025 23:00 → các giờ 01/01/2026). `generated_at` là lúc chạy precompute (UTC)."
+        )
 
     llm_text_cached = cache_meta.get("llm_text", "")
     raw = cache_raw_df["Raw"].to_numpy(dtype=float)
     idx = fc_df["Thời gian"].to_numpy()
     cal = fc_df["PM2.5 (μg/m³)"].to_numpy(dtype=float)
 
+    render_hourly_forecast_strip(fc_df)
     render_forecast_chart(fc_df)
     band, color = pm25_aqi_band_vn(float(np.mean(cal)))
     st.markdown(

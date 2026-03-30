@@ -4,30 +4,28 @@ import argparse
 import json
 import os
 import time
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from pm25_app.config import (
-    ARTIFACT_DIR,
-    BASE_DIR,
-    DEFAULT_FALLBACK_CSV,
-    FORECAST_CACHE_FILE,
-    FORECAST_CACHE_META,
-)
+from pm25_app.config import ARTIFACT_DIR, BASE_DIR, FORECAST_CACHE_FILE, FORECAST_CACHE_META
 from pm25_app.env_utils import load_env_file
 from timemoe_pm25_pipeline import (
     NOTEBOOK_BEST_ALPHA,
     NOTEBOOK_BEST_FEATURES,
     NOTEBOOK_BEST_THRESHOLD,
+    OPEN_METEO_HISTORY_START,
     fetch_open_meteo_hcmc,
     fit_calibration_quick,
     forecast_next_hours,
-    load_csv_flexible,
     load_timemoe_model,
     resolve_default_timemoe_dir,
 )
+
+
+def dataset_data_mode() -> str:
+    m = os.getenv("PM25_DATA_MODE", "historical").strip().lower()
+    return "realtime" if m in ("realtime", "live") else "historical"
 
 
 def write_cache(fc_df: pd.DataFrame, raw: np.ndarray, meta: dict) -> None:
@@ -74,20 +72,27 @@ def generate_llm_alert_from_forecast(fc_df: pd.DataFrame) -> str:
         if provider == "gemini":
             gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
             if not gemini_key:
-                return ""
+                raise RuntimeError(
+                    "Thiếu GEMINI_API_KEY trong môi trường / .env — không sinh khuyến nghị LLM."
+                )
 
             from google import genai
 
             client = genai.Client(api_key=gemini_key)
             model = os.getenv("LLM_MODEL", "gemini-2.5-flash")
             response = client.models.generate_content(model=model, contents=prompt)
-            return (response.text or "").strip()
+            text = (response.text or "").strip()
+            if not text:
+                raise RuntimeError("Gemini trả về nội dung rỗng.")
+            return text
 
         import requests
 
         api_key = os.getenv("LLM_API_KEY", "").strip()
         if not api_key:
-            return ""
+            raise RuntimeError(
+                "Thiếu LLM_API_KEY trong môi trường / .env — không sinh khuyến nghị LLM (provider OpenAI-compatible)."
+            )
         api_base = os.getenv("LLM_API_BASE", "https://api.openai.com/v1").rstrip("/")
         model = os.getenv("LLM_MODEL", "gpt-4o-mini")
         payload = {
@@ -102,29 +107,31 @@ def generate_llm_alert_from_forecast(fc_df: pd.DataFrame) -> str:
         r = requests.post(f"{api_base}/chat/completions", headers=headers, json=payload, timeout=20)
         r.raise_for_status()
         data = r.json()
-        return data["choices"][0]["message"]["content"].strip()
+        text = data["choices"][0]["message"]["content"].strip()
+        if not text:
+            raise RuntimeError("LLM trả về nội dung rỗng.")
+        return text
+    except RuntimeError:
+        raise
     except Exception as e:
-        return f"(LLM precompute lỗi: {e})"
+        raise RuntimeError(f"Lỗi gọi LLM khi precompute: {e}") from e
 
 
-def load_dataset(end_date_live: str) -> pd.DataFrame:
-    fallback_path = Path(os.getenv("DATASET_FALLBACK_CSV", str(DEFAULT_FALLBACK_CSV))).expanduser()
-    try:
-        return fetch_open_meteo_hcmc(start_date="2021-01-01", end_date=end_date_live)
-    except Exception as e:
-        if fallback_path.is_file():
-            print(f"[WARN] Open-Meteo lỗi, dùng fallback CSV: {fallback_path}")
-            return load_csv_flexible(fallback_path)
-        raise RuntimeError(
-            "Không tải được Open-Meteo và không tìm thấy file CSV fallback tại "
-            f"{fallback_path}: {e}"
-        ) from e
+def load_dataset() -> pd.DataFrame:
+    """Open-Meteo: mặc định lịch sử 2021-01-01 → 2025-12-31; với PM25_DATA_MODE=realtime thì end_date=hôm nay và cắt tại now−1h."""
+    if dataset_data_mode() == "realtime":
+        end_live = pd.Timestamp.now(tz="Asia/Ho_Chi_Minh").strftime("%Y-%m-%d")
+        return fetch_open_meteo_hcmc(
+            start_date=OPEN_METEO_HISTORY_START,
+            end_date=end_live,
+            use_realtime_last_observation=True,
+        )
+    return fetch_open_meteo_hcmc()
 
 
 def run_once(max_val_windows_quick: int = 160) -> None:
     load_env_file(BASE_DIR / ".env", override_all=True)
-    end_date_live = pd.Timestamp.now(tz="Asia/Ho_Chi_Minh").strftime("%Y-%m-%d")
-    df = load_dataset(end_date_live=end_date_live)
+    df = load_dataset()
     model_path = os.getenv("MODEL_CHECKPOINT", str(resolve_default_timemoe_dir(BASE_DIR)))
     model, model_id, device = load_timemoe_model(
         device="cpu", local_model_path=model_path, local_files_only=True
@@ -159,6 +166,7 @@ def run_once(max_val_windows_quick: int = 160) -> None:
         {
             "generated_at_utc": str(now_ts),
             "dataset_last_time": str(df["date"].iloc[-1]),
+            "data_mode": dataset_data_mode(),
             "model_id": str(model_id),
             "max_val_windows_quick": int(max_val_windows_quick),
             "n_val_windows_used": ev.get("n_val_windows_used"),

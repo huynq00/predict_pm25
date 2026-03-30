@@ -21,6 +21,10 @@ PRED_LEN = 24
 TRAIN_RATIO = 0.8
 VAL_RATIO_IN_EVAL = 0.35
 
+# Dữ liệu huấn luyện / hiệu chỉnh chỉ lấy từ Open-Meteo Archive & Air Quality API (không đọc CSV).
+OPEN_METEO_HISTORY_START = "2021-01-01"
+OPEN_METEO_HISTORY_END = "2025-12-31"
+
 CANDIDATE_MODELS = ["Maple728/TimeMoE-200M", "Maple728/TimeMoE-50M"]
 NOTEBOOK_BEST_ALPHA = 0.85
 
@@ -74,11 +78,18 @@ def pm25_aqi_band_vn(ug_m3: float) -> tuple[str, str]:
 
 
 def fetch_open_meteo_hcmc(
-    start_date: str = "2021-01-01",
-    end_date: str = "2025-12-31",
+    start_date: str = OPEN_METEO_HISTORY_START,
+    end_date: str = OPEN_METEO_HISTORY_END,
     lat: float = 10.7756,
     lon: float = 106.7019,
+    *,
+    use_realtime_last_observation: bool = False,
 ) -> pd.DataFrame:
+    """Tải hourly weather + PM2.5 từ Open-Meteo (archive + air-quality), khoảng [start_date, end_date].
+
+    - ``use_realtime_last_observation=False`` (mặc định): cắt tại 23:00 ngày ``end_date`` (chuỗi lịch sử cố định).
+    - ``use_realtime_last_observation=True``: cắt tại **giờ hiện tại (Asia/Ho_Chi_Minh) sàn xuống 1 giờ** để tránh giờ chưa khóa sổ trên API; dùng khi ``end_date`` là hôm nay.
+    """
     weather_vars = [
         "temperature_2m",
         "relative_humidity_2m",
@@ -145,78 +156,25 @@ def fetch_open_meteo_hcmc(
     )
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values("date").reset_index(drop=True)
-    # Realtime an toàn: chỉ lấy dữ liệu đến trước thời điểm hiện tại 1 giờ.
-    # Tránh dùng giờ hiện tại khi dữ liệu API có thể chưa hoàn tất.
-    now_local_naive = pd.Timestamp.now(tz="Asia/Ho_Chi_Minh").tz_localize(None)
-    cutoff = now_local_naive.floor("h") - pd.Timedelta(hours=1)
-    df = df[df["date"] <= cutoff].reset_index(drop=True)
-    if df.empty:
-        raise RuntimeError("Open-Meteo chưa có đủ dữ liệu đến mốc hiện tại - 1 giờ.")
+    if use_realtime_last_observation:
+        now_local_naive = pd.Timestamp.now(tz="Asia/Ho_Chi_Minh").tz_localize(None)
+        cutoff = now_local_naive.floor("h") - pd.Timedelta(hours=1)
+        df = df[df["date"] <= cutoff].reset_index(drop=True)
+        if df.empty:
+            raise RuntimeError(
+                "Open-Meteo chưa có đủ dữ liệu tới mốc hiện tại − 1 giờ (chế độ realtime)."
+            )
+    else:
+        last_hist_ts = pd.Timestamp(end_date) + pd.Timedelta(hours=23)
+        df = df[df["date"] <= last_hist_ts].reset_index(drop=True)
+        if df.empty:
+            raise RuntimeError(
+                f"Không còn dữ liệu sau khi giới hạn tới cuối ngày {end_date} (23:00)."
+            )
     num_cols = [c for c in df.columns if c != "date"]
     df[num_cols] = df[num_cols].apply(pd.to_numeric, errors="coerce")
     df[num_cols] = df[num_cols].interpolate(limit_direction="both").bfill().ffill()
     return df
-
-
-def _standard_columns() -> list[str]:
-    return [
-        "date",
-        "temp",
-        "hum",
-        "dew",
-        "apparent_temp",
-        "pressure",
-        "cloud",
-        "wind",
-        "wind_dir",
-        "rain",
-        "solar",
-        "pm2_5",
-    ]
-
-
-def normalize_pm25_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    """Chuẩn hóa cột giống notebook (Open-Meteo / HCMC CSV)."""
-    # Định dạng notebook / Open-Meteo đã chuẩn
-    if "date" in df.columns and "pm2_5" in df.columns:
-        out = df.copy()
-        out["date"] = pd.to_datetime(out["date"])
-    elif "time" in df.columns:
-        out = df.rename(columns={"time": "date"})
-        out["date"] = pd.to_datetime(out["date"])
-    elif "Date_Time" in df.columns:
-        out = df.rename(
-            columns={
-                "Date_Time": "date",
-                "Temperature_C": "temp",
-                "Humidity_pct": "hum",
-                "Wind_Speed_ms": "wind",
-                "Precipitation_mm": "rain",
-                "Pressure_hPa": "pressure",
-                "Cloud_Cover_pct": "cloud",
-                "Radiation_W": "solar",
-                "PM2_5": "pm2_5",
-            }
-        )
-        out["date"] = pd.to_datetime(out["date"])
-    else:
-        raise ValueError("Không nhận diện được cột thời gian / PM2.5 trong CSV.")
-
-    for c in _standard_columns():
-        if c not in out.columns:
-            out[c] = np.nan
-    out = out[_standard_columns()]
-    num_cols = [c for c in out.columns if c != "date"]
-    out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce")
-    out[num_cols] = out[num_cols].interpolate(limit_direction="both").bfill().ffill()
-    # Một số nguồn có cột thiếu hoàn toàn (vd. dew, wind_dir) => vẫn NaN sau nội suy.
-    # Điền về 0 để tránh scaler/predict sinh NaN và biểu đồ trống.
-    out[num_cols] = out[num_cols].fillna(0.0)
-    return out.sort_values("date").reset_index(drop=True)
-
-
-def load_csv_flexible(path: Path | str) -> pd.DataFrame:
-    return normalize_pm25_dataframe(pd.read_csv(Path(path)))
 
 
 def load_timemoe_model(
