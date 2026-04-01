@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import logging
 import os
 import time
 
@@ -21,6 +23,38 @@ from timemoe_pm25_pipeline import (
     load_timemoe_model,
     resolve_default_timemoe_dir,
 )
+
+_LOG = logging.getLogger("pm25.precompute")
+_pm25_root_configured = False
+
+
+def ensure_pm25_logging() -> None:
+    """Gắn handler stdout một lần cho logger `pm25` (dùng chung với `pm25.timemoe`)."""
+    global _pm25_root_configured
+    root = logging.getLogger("pm25")
+    if _pm25_root_configured and root.handlers:
+        return
+    if not root.handlers:
+        h = logging.StreamHandler()
+        h.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] [%(name)s] %(message)s",
+                "%Y-%m-%d %H:%M:%S",
+            )
+        )
+        root.addHandler(h)
+    root.setLevel(logging.INFO)
+    _pm25_root_configured = True
+
+
+@contextlib.contextmanager
+def _timed_stage(name: str):
+    t0 = time.perf_counter()
+    _LOG.info("→ %s", name)
+    try:
+        yield
+    finally:
+        _LOG.info("← %s (%.1fs)", name, time.perf_counter() - t0)
 
 
 def dataset_data_mode() -> str:
@@ -130,48 +164,78 @@ def load_dataset() -> pd.DataFrame:
 
 
 def run_once(max_val_windows_quick: int = 160) -> None:
-    load_env_file(BASE_DIR / ".env", override_all=True)
-    df = load_dataset()
-    model_path = os.getenv("MODEL_CHECKPOINT", str(resolve_default_timemoe_dir(BASE_DIR)))
-    model, model_id, device = load_timemoe_model(
-        device="cpu", local_model_path=model_path, local_files_only=True
+    ensure_pm25_logging()
+    t_run = time.perf_counter()
+    with _timed_stage("load .env"):
+        load_env_file(BASE_DIR / ".env", override_all=True)
+    _LOG.info("Chế độ dữ liệu: %s", dataset_data_mode())
+
+    with _timed_stage("Open-Meteo: tải dataset"):
+        df = load_dataset()
+    _LOG.info(
+        "Dataset: %d dòng | quan sát cuối (UTC/local theo API): %s",
+        len(df),
+        df["date"].iloc[-1],
     )
-    ev = fit_calibration_quick(
-        df,
-        model,
-        device,
-        alpha_pm=NOTEBOOK_BEST_ALPHA,
-        corr_threshold=NOTEBOOK_BEST_THRESHOLD,
-        max_val_windows=max_val_windows_quick,
-        forced_features=NOTEBOOK_BEST_FEATURES,
-    )
-    idx, cal, raw = forecast_next_hours(
-        df,
-        model,
-        device,
-        alpha_pm=NOTEBOOK_BEST_ALPHA,
-        corr_threshold=NOTEBOOK_BEST_THRESHOLD,
-        cal_a=ev["calibration_a"],
-        cal_b=ev["calibration_b"],
-        forced_features=NOTEBOOK_BEST_FEATURES,
-    )
+
+    raw_ckpt = os.getenv("MODEL_CHECKPOINT", "").strip()
+    model_path = raw_ckpt or str(resolve_default_timemoe_dir(BASE_DIR))
+    _LOG.info("MODEL_CHECKPOINT → %s", model_path)
+
+    with _timed_stage("Time-MoE: load checkpoint local"):
+        model, model_id, device = load_timemoe_model(device="cpu", local_model_path=model_path)
+
+    with _timed_stage("Time-MoE: hiệu chỉnh nhanh (fit_calibration_quick)"):
+        ev = fit_calibration_quick(
+            df,
+            model,
+            device,
+            alpha_pm=NOTEBOOK_BEST_ALPHA,
+            corr_threshold=NOTEBOOK_BEST_THRESHOLD,
+            max_val_windows=max_val_windows_quick,
+            forced_features=NOTEBOOK_BEST_FEATURES,
+        )
+
+    with _timed_stage("Time-MoE: dự báo 24h (forecast_next_hours)"):
+        idx, cal, raw = forecast_next_hours(
+            df,
+            model,
+            device,
+            alpha_pm=NOTEBOOK_BEST_ALPHA,
+            corr_threshold=NOTEBOOK_BEST_THRESHOLD,
+            cal_a=ev["calibration_a"],
+            cal_b=ev["calibration_b"],
+            forced_features=NOTEBOOK_BEST_FEATURES,
+        )
     cal = np.nan_to_num(cal, nan=0.0, posinf=0.0, neginf=0.0)
     raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
     fc_df = pd.DataFrame({"Thời gian": idx, "PM2.5 (μg/m³)": cal})
-    llm_text = generate_llm_alert_from_forecast(fc_df)
+
+    with _timed_stage("LLM: khuyến nghị sức khỏe"):
+        llm_text = generate_llm_alert_from_forecast(fc_df)
+
     now_ts = pd.Timestamp.utcnow()
-    write_cache(
-        fc_df,
-        raw,
-        {
-            "generated_at_utc": str(now_ts),
-            "dataset_last_time": str(df["date"].iloc[-1]),
-            "data_mode": dataset_data_mode(),
-            "model_id": str(model_id),
-            "max_val_windows_quick": int(max_val_windows_quick),
-            "n_val_windows_used": ev.get("n_val_windows_used"),
-            "llm_text": llm_text,
-        },
+    with _timed_stage("Ghi artifacts (CSV + JSON)"):
+        write_cache(
+            fc_df,
+            raw,
+            {
+                "generated_at_utc": str(now_ts),
+                "dataset_last_time": str(df["date"].iloc[-1]),
+                "data_mode": dataset_data_mode(),
+                "model_id": str(model_id),
+                "max_val_windows_quick": int(max_val_windows_quick),
+                "n_val_windows_used": ev.get("n_val_windows_used"),
+                "llm_text": llm_text,
+            },
+        )
+    _LOG.info(
+        "Hoàn tất precompute: %.1fs | PM2.5 mean=%.2f min=%.2f max=%.2f | cache UTC=%s",
+        time.perf_counter() - t_run,
+        float(np.mean(cal)),
+        float(np.min(cal)),
+        float(np.max(cal)),
+        now_ts,
     )
     print(
         f"[OK] cache updated at {now_ts} UTC | mean={float(np.mean(cal)):.2f} | "

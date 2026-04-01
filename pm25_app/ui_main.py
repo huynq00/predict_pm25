@@ -15,6 +15,9 @@ from pm25_app.hourly_strip import render_hourly_forecast_strip
 from pm25_app.precompute_trigger import run_precompute_locked, should_trigger_precompute
 from timemoe_pm25_pipeline import CONTEXT_LEN, PRED_LEN, pm25_aqi_band_vn
 
+# Chu kỳ coi cache là “cũ” + tự reload trình duyệt (phút); không còn chỉnh trên UI.
+REFRESH_MINUTES = 60
+
 
 def inject_custom_css() -> None:
     st.markdown(
@@ -181,6 +184,7 @@ def main() -> None:
         page_title="Dự báo PM2.5 TP.HCM (Time-MoE)",
         page_icon="🌫️",
         layout="wide",
+        initial_sidebar_state="collapsed",
     )
     load_env_file(BASE_DIR / ".env")
     inject_custom_css()
@@ -191,22 +195,7 @@ def main() -> None:
         "Precompute (Open-Meteo + Time-MoE + LLM) chạy **trên máy chủ Streamlit**, không chạy trong trình duyệt."
     )
 
-    with st.sidebar:
-        st.header("Trang xem nhanh")
-        refresh_minutes = st.number_input(
-            "Chu kỳ làm mới dự báo + tải lại trang (phút)",
-            min_value=15,
-            max_value=180,
-            value=60,
-            step=15,
-            key="pm25_refresh_minutes",
-            help="Mỗi lần tải trang: nếu chưa có cache hoặc cache cũ hơn số phút này thì chạy precompute trên server. Trình duyệt tự reload sau cùng khoảng thời gian để kiểm tra lại.",
-        )
-        st.caption(
-            "Có thể vẫn chạy `python precompute_forecast.py` từ terminal hoặc cron nếu muốn cập nhật khi không ai mở web."
-        )
-
-    if should_trigger_precompute(int(refresh_minutes)):
+    if should_trigger_precompute(REFRESH_MINUTES):
         with st.spinner(
             "Đang cập nhật dự báo trên server (Open-Meteo, Time-MoE, LLM) — có thể vài phút..."
         ):
@@ -225,9 +214,9 @@ def main() -> None:
         st.error(str(e))
         st.stop()
 
-    schedule_auto_refresh(int(refresh_minutes))
+    schedule_auto_refresh(REFRESH_MINUTES)
     st.caption(
-        f"Tự động tải lại trang mỗi {int(refresh_minutes)} phút; sau mỗi lần tải lại, server sẽ precompute lại nếu cache đã cũ hơn cùng số phút."
+        f"Tự động tải lại trang mỗi {REFRESH_MINUTES} phút; sau mỗi lần tải lại, server sẽ precompute lại nếu cache đã cũ hơn cùng số phút."
     )
 
     now_ts = pd.Timestamp.utcnow()
@@ -235,7 +224,7 @@ def main() -> None:
     try:
         generated_at = pd.to_datetime(cache_meta.get("generated_at_utc"))
         age_sec = (now_ts - generated_at).total_seconds()
-        fresh = age_sec >= 0 and age_sec < int(refresh_minutes) * 60
+        fresh = age_sec >= 0 and age_sec < REFRESH_MINUTES * 60
     except Exception:
         fresh = False
 
@@ -243,7 +232,7 @@ def main() -> None:
         st.success(f"Cache còn mới (generated_at={gen_at} UTC).")
     else:
         st.warning(
-            f"Cache đã lưu (generated_at={gen_at} UTC). Lần tải trang tiếp theo sẽ precompute lại khi đã quá {int(refresh_minutes)} phút (hoặc dùng nút rerun / reload trình duyệt sau khi đủ thời gian)."
+            f"Cache đã lưu (generated_at={gen_at} UTC). Lần tải trang tiếp theo sẽ precompute lại khi đã quá {REFRESH_MINUTES} phút (hoặc dùng nút rerun / reload trình duyệt sau khi đủ thời gian)."
         )
 
     st.subheader("Thông tin lần tính gần nhất")
@@ -298,12 +287,6 @@ def main() -> None:
             pd.DataFrame({"Thời gian": idx, "Calibrated": cal, "Raw": raw}),
             width="stretch",
         )
-
-    st.divider()
-    st.markdown(
-        "**Ghi chú:** Kết quả do pipeline Time-MoE zero-shot + hiệu chỉnh tuyến tính (xem notebook). "
-        "Tham chiếu sức khỏe cần đối chiếu quy chuẩn Việt Nam / WHO."
-    )
 
 
 if __name__ == "__main__":

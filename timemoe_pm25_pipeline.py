@@ -3,9 +3,13 @@ Pipeline PM2.5 Time-MoE zero-shot — khớp logic HCMC_PM25_TimeMoE_ZeroShot_Fu
 """
 from __future__ import annotations
 
+import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
+
+_log = logging.getLogger("pm25.timemoe")
 
 import numpy as np
 import pandas as pd
@@ -25,7 +29,6 @@ VAL_RATIO_IN_EVAL = 0.35
 OPEN_METEO_HISTORY_START = "2021-01-01"
 OPEN_METEO_HISTORY_END = "2025-12-31"
 
-CANDIDATE_MODELS = ["Maple728/TimeMoE-200M", "Maple728/TimeMoE-50M"]
 NOTEBOOK_BEST_ALPHA = 0.85
 
 
@@ -179,9 +182,13 @@ def fetch_open_meteo_hcmc(
 
 def load_timemoe_model(
     device: str | None = None,
-    local_model_path: str | None = None,
-    local_files_only: bool = False,
+    local_model_path: str | Path | None = None,
 ) -> tuple[Any, str, str]:
+    """
+    Chỉ load checkpoint **trên đĩa** (`local_files_only=True`). Không tải model từ Hugging Face Hub.
+
+    Đặt thư mục chứa `config.json` (vd. `streamlit_app/models/TimeMoE-200M/`) hoặc set `MODEL_CHECKPOINT` trong `.env`.
+    """
     ensure_local_hf_cache()
     import transformers
 
@@ -190,34 +197,31 @@ def load_timemoe_model(
             f"Cần transformers==4.40.1 (hiện {transformers.__version__}) để tránh lỗi Time-MoE."
         )
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    last_err = None
-    if local_model_path:
-        p = Path(local_model_path).expanduser()
-        if not p.exists():
-            raise FileNotFoundError(f"Không thấy thư mục model local: {p}")
-        try:
-            m = AutoModelForCausalLM.from_pretrained(
-                str(p),
-                trust_remote_code=True,
-                local_files_only=True,
-            )
-            m = m.to(dev)
-            return m, f"local:{p}", dev
-        except Exception as e:
-            raise RuntimeError(f"Không load được model local từ {p}: {e}") from e
-
-    for model_id in CANDIDATE_MODELS:
-        try:
-            m = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                trust_remote_code=True,
-                local_files_only=local_files_only,
-            )
-            m = m.to(dev)
-            return m, model_id, dev
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"Không tải được Time-MoE: {last_err}")
+    if not local_model_path or not str(local_model_path).strip():
+        raise FileNotFoundError(
+            "Bắt buộc chỉ định checkpoint Time-MoE local (không tải từ Hub). "
+            "Đặt model tại `streamlit_app/models/TimeMoE-200M/` hoặc set biến môi trường MODEL_CHECKPOINT."
+        )
+    p = Path(local_model_path).expanduser()
+    if not p.is_dir():
+        raise FileNotFoundError(
+            f"Không thấy thư mục checkpoint local: {p} "
+            "(cần thư mục chứa config.json và weights, đã copy sẵn từ máy)."
+        )
+    t0 = time.perf_counter()
+    _log.info("load_timemoe_model: bắt đầu from_pretrained từ %s (device=%s)", p, dev)
+    try:
+        m = AutoModelForCausalLM.from_pretrained(
+            str(p),
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        m = m.to(dev)
+        _log.info("load_timemoe_model: xong trong %.1fs", time.perf_counter() - t0)
+        return m, f"local:{p}", dev
+    except Exception as e:
+        _log.exception("load_timemoe_model: lỗi sau %.1fs", time.perf_counter() - t0)
+        raise RuntimeError(f"Không load được model local từ {p}: {e}") from e
 
 
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
@@ -309,15 +313,34 @@ def run_predict_windows(
     batch_size: int = 64,
 ) -> np.ndarray:
     model.eval()
+    n = len(X_ctx)
+    n_batches = (n + batch_size - 1) // batch_size if n else 0
+    t_all = time.perf_counter()
+    _log.info(
+        "run_predict_windows: n_windows=%d, pred_len=%d, batch_size=%d → %d batch",
+        n,
+        pred_len,
+        batch_size,
+        n_batches,
+    )
     preds = []
     with torch.no_grad():
-        for i in range(0, len(X_ctx), batch_size):
+        for bi, i in enumerate(range(0, n, batch_size)):
+            t_b = time.perf_counter()
             xb = torch.tensor(X_ctx[i : i + batch_size], dtype=torch.float32, device=device)
             out = model.generate(xb, max_new_tokens=pred_len)
             out_np = out.detach().cpu().numpy()
             if out_np.ndim != 2:
                 raise RuntimeError(f"Unexpected output shape: {out_np.shape}, expected [B, T].")
             preds.append(out_np[:, -pred_len:])
+            _log.info(
+                "run_predict_windows: batch %d/%d xong (%.1fs) | shape=%s",
+                bi + 1,
+                n_batches,
+                time.perf_counter() - t_b,
+                getattr(out_np, "shape", None),
+            )
+    _log.info("run_predict_windows: tổng %.1fs", time.perf_counter() - t_all)
     return np.concatenate(preds, axis=0)
 
 
@@ -387,6 +410,12 @@ def fit_calibration_quick(
     - chỉ dùng validation để fit y = a*y_hat + b
     - giới hạn số cửa sổ để giảm thời gian chờ
     """
+    t0 = time.perf_counter()
+    _log.info(
+        "fit_calibration_quick: bắt đầu (max_val_windows=%d, alpha=%.3f)",
+        max_val_windows,
+        alpha_pm,
+    )
     eval_scaled, pm_eval, _, mu_y, sigma_y, pm_corr = prepare_arrays(df)
     signal, selected_features, _ = build_signal(
         eval_scaled,
@@ -400,6 +429,11 @@ def fit_calibration_quick(
     X_val, y_val_norm = make_windows_1d(
         signal, pm_eval, CONTEXT_LEN, PRED_LEN, max_windows=max_val_windows
     )
+    _log.info(
+        "fit_calibration_quick: đã tạo %d cửa sổ val; chuẩn bị generate (%.1fs từ đầu bước)",
+        len(X_val),
+        time.perf_counter() - t0,
+    )
 
     pred_val_norm = run_predict_windows(model, X_val, device)
     y_val = y_val_norm * sigma_y + mu_y
@@ -409,6 +443,12 @@ def fit_calibration_quick(
     lr.fit(pred_val.reshape(-1, 1), y_val.reshape(-1))
     a = float(lr.coef_[0])
     b = float(lr.intercept_)
+    _log.info(
+        "fit_calibration_quick: xong hiệu chỉnh a=%.4f b=%.4f (tổng %.1fs)",
+        a,
+        b,
+        time.perf_counter() - t0,
+    )
     return {
         "calibration_a": a,
         "calibration_b": b,
@@ -443,6 +483,7 @@ def forecast_next_hours(
     if len(signal) < CONTEXT_LEN:
         raise ValueError("Chuỗi quá ngắn so với CONTEXT_LEN.")
     ctx = signal[-CONTEXT_LEN:][np.newaxis, :].astype(np.float32)
+    _log.info("forecast_next_hours: 1 cửa sổ ngữ cảnh → generate %d mốc", PRED_LEN)
     pred_norm = run_predict_windows(model, ctx, device, pred_len=PRED_LEN, batch_size=1)
     raw = pred_norm[0] * sigma_y + mu_y
     cal = cal_a * raw + cal_b
