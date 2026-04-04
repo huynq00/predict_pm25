@@ -31,7 +31,7 @@ def should_trigger_precompute(interval_minutes: int) -> bool:
     return age >= float(interval_minutes)
 
 
-def run_precompute_locked(max_val_windows_quick: int = 160) -> tuple[LockOutcome, str | None]:
+def run_precompute_locked() -> tuple[LockOutcome, str | None]:
     """
     Chạy run_once với file lock để tránh hai phiên Streamlit/tab chạy trùng.
     Trả về ("ok", None) | ("busy", None) | ("error", message).
@@ -42,7 +42,7 @@ def run_precompute_locked(max_val_windows_quick: int = 160) -> tuple[LockOutcome
         import fcntl
     except ImportError:
         try:
-            run_once(max_val_windows_quick=max_val_windows_quick)
+            run_once()
             return "ok", None
         except Exception as e:
             return "error", str(e)
@@ -55,7 +55,7 @@ def run_precompute_locked(max_val_windows_quick: int = 160) -> tuple[LockOutcome
         return "busy", None
     try:
         try:
-            run_once(max_val_windows_quick=max_val_windows_quick)
+            run_once()
             return "ok", None
         except Exception as e:
             return "error", str(e)

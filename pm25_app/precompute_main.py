@@ -18,7 +18,6 @@ from timemoe_pm25_pipeline import (
     NOTEBOOK_BEST_THRESHOLD,
     OPEN_METEO_HISTORY_START,
     fetch_open_meteo_hcmc,
-    fit_calibration_quick,
     forecast_next_hours,
     load_timemoe_model,
     resolve_default_timemoe_dir,
@@ -62,13 +61,12 @@ def dataset_data_mode() -> str:
     return "realtime" if m in ("realtime", "live") else "historical"
 
 
-def write_cache(fc_df: pd.DataFrame, raw: np.ndarray, meta: dict) -> None:
+def write_cache(fc_df: pd.DataFrame, meta: dict) -> None:
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
     out = pd.DataFrame(
         {
             "Thời gian": pd.to_datetime(fc_df["Thời gian"]),
-            "Calibrated": fc_df["PM2.5 (μg/m³)"].astype(float).to_numpy(),
-            "Raw": np.asarray(raw, dtype=float),
+            "PM2.5 (μg/m³)": fc_df["PM2.5 (μg/m³)"].astype(float).to_numpy(),
         }
     )
     out.to_csv(FORECAST_CACHE_FILE, index=False)
@@ -163,7 +161,7 @@ def load_dataset() -> pd.DataFrame:
     return fetch_open_meteo_hcmc()
 
 
-def run_once(max_val_windows_quick: int = 160) -> None:
+def run_once() -> None:
     ensure_pm25_logging()
     t_run = time.perf_counter()
     with _timed_stage("load .env"):
@@ -185,31 +183,17 @@ def run_once(max_val_windows_quick: int = 160) -> None:
     with _timed_stage("Time-MoE: load checkpoint local"):
         model, model_id, device = load_timemoe_model(device="cpu", local_model_path=model_path)
 
-    with _timed_stage("Time-MoE: hiệu chỉnh nhanh (fit_calibration_quick)"):
-        ev = fit_calibration_quick(
+    with _timed_stage("Time-MoE: dự báo 24h (forecast_next_hours, thô)"):
+        idx, raw = forecast_next_hours(
             df,
             model,
             device,
             alpha_pm=NOTEBOOK_BEST_ALPHA,
             corr_threshold=NOTEBOOK_BEST_THRESHOLD,
-            max_val_windows=max_val_windows_quick,
             forced_features=NOTEBOOK_BEST_FEATURES,
         )
-
-    with _timed_stage("Time-MoE: dự báo 24h (forecast_next_hours)"):
-        idx, cal, raw = forecast_next_hours(
-            df,
-            model,
-            device,
-            alpha_pm=NOTEBOOK_BEST_ALPHA,
-            corr_threshold=NOTEBOOK_BEST_THRESHOLD,
-            cal_a=ev["calibration_a"],
-            cal_b=ev["calibration_b"],
-            forced_features=NOTEBOOK_BEST_FEATURES,
-        )
-    cal = np.nan_to_num(cal, nan=0.0, posinf=0.0, neginf=0.0)
     raw = np.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
-    fc_df = pd.DataFrame({"Thời gian": idx, "PM2.5 (μg/m³)": cal})
+    fc_df = pd.DataFrame({"Thời gian": idx, "PM2.5 (μg/m³)": raw})
 
     with _timed_stage("LLM: khuyến nghị sức khỏe"):
         llm_text = generate_llm_alert_from_forecast(fc_df)
@@ -218,28 +202,25 @@ def run_once(max_val_windows_quick: int = 160) -> None:
     with _timed_stage("Ghi artifacts (CSV + JSON)"):
         write_cache(
             fc_df,
-            raw,
             {
                 "generated_at_utc": str(now_ts),
                 "dataset_last_time": str(df["date"].iloc[-1]),
                 "data_mode": dataset_data_mode(),
                 "model_id": str(model_id),
-                "max_val_windows_quick": int(max_val_windows_quick),
-                "n_val_windows_used": ev.get("n_val_windows_used"),
                 "llm_text": llm_text,
             },
         )
     _LOG.info(
         "Hoàn tất precompute: %.1fs | PM2.5 mean=%.2f min=%.2f max=%.2f | cache UTC=%s",
         time.perf_counter() - t_run,
-        float(np.mean(cal)),
-        float(np.min(cal)),
-        float(np.max(cal)),
+        float(np.mean(raw)),
+        float(np.min(raw)),
+        float(np.max(raw)),
         now_ts,
     )
     print(
-        f"[OK] cache updated at {now_ts} UTC | mean={float(np.mean(cal)):.2f} | "
-        f"min={float(np.min(cal)):.2f} | max={float(np.max(cal)):.2f}"
+        f"[OK] cache updated at {now_ts} UTC | mean={float(np.mean(raw)):.2f} | "
+        f"min={float(np.min(raw)):.2f} | max={float(np.max(raw)):.2f}"
     )
 
 
@@ -249,18 +230,15 @@ def main() -> None:
     parser.add_argument(
         "--loop-minutes", type=int, default=60, help="Loop interval in minutes (default: 60)."
     )
-    parser.add_argument(
-        "--max-val-windows-quick", type=int, default=160, help="Validation windows for calibration."
-    )
     args = parser.parse_args()
 
     if args.once:
-        run_once(max_val_windows_quick=args.max_val_windows_quick)
+        run_once()
         return
 
     while True:
         try:
-            run_once(max_val_windows_quick=args.max_val_windows_quick)
+            run_once()
         except Exception as e:
             print(f"[ERROR] precompute failed: {e}")
         sleep_sec = max(1, int(args.loop_minutes)) * 60

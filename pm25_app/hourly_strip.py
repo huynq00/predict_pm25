@@ -115,7 +115,7 @@ def build_hourly_strip_html(fc_df: pd.DataFrame) -> str:
     return (
         "<div class=\"pm25-hourly-wrap\">"
         "<h3>Dự báo theo giờ</h3>"
-        "<p class=\"pm25-hourly-sub\">PM2.5 dự báo (Time-MoE, đã hiệu chỉnh) — TP.HCM.</p>"
+        "<p class=\"pm25-hourly-sub\">PM2.5 dự báo thô (Time-MoE) — TP.HCM.</p>"
         f"<div class=\"pm25-hourly-scroll\">{body}</div>"
         "</div>"
     )

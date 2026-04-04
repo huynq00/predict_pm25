@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 import requests
 import torch
-from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 from transformers import AutoModelForCausalLM
@@ -291,8 +290,8 @@ def make_windows_1d(
     max_windows: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Trượt cửa sổ ngữ cảnh. Nếu `max_windows` được set (vd. hiệu chỉnh nhanh),
-    chỉ tạo đủ cửa sổ đầu tiên — tránh tạo hàng chục nghìn mảng khi chỉ cần ~160.
+    Trượt cửa sổ ngữ cảnh. Nếu `max_windows` được set, chỉ tạo tối đa nhiều đó
+    cửa sổ đầu tiên — tiết kiệm bộ nhớ / thời gian khi không cần toàn bộ chuỗi.
     """
     X, y = [], []
     max_i = len(arr_signal) - context_len - pred_len + 1
@@ -352,7 +351,7 @@ def run_eval_pipeline(
     corr_threshold: float,
     forced_features: list[str] | None = None,
 ) -> dict[str, Any]:
-    eval_scaled, pm_eval, scaler, mu_y, sigma_y, pm_corr = prepare_arrays(df)
+    eval_scaled, pm_eval, _, mu_y, sigma_y, pm_corr = prepare_arrays(df)
     signal, selected_features, _ = build_signal(
         eval_scaled,
         pm_eval,
@@ -365,57 +364,39 @@ def run_eval_pipeline(
     n_total = len(X_all)
     n_val = int(n_total * VAL_RATIO_IN_EVAL)
     n_val = max(80, min(n_val, n_total - 80))
-    X_val, X_test = X_all[:n_val], X_all[n_val:]
-    y_val_norm, y_test_norm = y_all_norm[:n_val], y_all_norm[n_val:]
-    pred_val_norm = run_predict_windows(model, X_val, device)
+    X_test = X_all[n_val:]
+    y_test_norm = y_all_norm[n_val:]
     pred_test_norm = run_predict_windows(model, X_test, device)
-    y_val = y_val_norm * sigma_y + mu_y
     y_test = y_test_norm * sigma_y + mu_y
-    pred_val = pred_val_norm * sigma_y + mu_y
     pred_test = pred_test_norm * sigma_y + mu_y
-    lr = LinearRegression()
-    lr.fit(pred_val.reshape(-1, 1), y_val.reshape(-1))
-    a = float(lr.coef_[0])
-    b = float(lr.intercept_)
-    pred_test_cal = a * pred_test + b
-    raw_m = compute_metrics(y_test, pred_test)
-    cal_m = compute_metrics(y_test, pred_test_cal)
+    metrics = compute_metrics(y_test, pred_test)
     return {
         "pm_corr": pm_corr,
         "selected_features": selected_features,
         "mu_y": mu_y,
         "sigma_y": sigma_y,
-        "calibration_a": a,
-        "calibration_b": b,
         "y_test": y_test,
-        "pred_test_raw": pred_test,
-        "pred_test_cal": pred_test_cal,
-        "metrics_raw": raw_m,
-        "metrics_cal": cal_m,
+        "pred_test": pred_test,
+        "metrics": metrics,
         "n_test_windows": len(y_test),
     }
 
 
-def fit_calibration_quick(
+def compute_test_metrics_on_test_split(
     df: pd.DataFrame,
     model: Any,
     device: str,
     alpha_pm: float,
     corr_threshold: float,
-    max_val_windows: int = 160,
     forced_features: list[str] | None = None,
+    *,
+    max_test_windows: int | None = None,
 ) -> dict[str, Any]:
     """
-    Bản nhanh cho suy luận 24h:
-    - chỉ dùng validation để fit y = a*y_hat + b
-    - giới hạn số cửa sổ để giảm thời gian chờ
+    MAE/RMSE/MAPE/R² trên tập test (cùng chia val|test như ``run_eval_pipeline``), dự báo **thô** (đã đảo scale PM2.5).
+
+    ``max_test_windows``: ``None`` = toàn bộ test; số nguyên dương = chỉ ``max_test_windows`` cửa sổ gần nhất.
     """
-    t0 = time.perf_counter()
-    _log.info(
-        "fit_calibration_quick: bắt đầu (max_val_windows=%d, alpha=%.3f)",
-        max_val_windows,
-        alpha_pm,
-    )
     eval_scaled, pm_eval, _, mu_y, sigma_y, pm_corr = prepare_arrays(df)
     signal, selected_features, _ = build_signal(
         eval_scaled,
@@ -425,35 +406,27 @@ def fit_calibration_quick(
         corr_threshold=corr_threshold,
         forced_features=forced_features,
     )
-    # Chỉ dựng cửa sổ cần cho hiệu chỉnh (mặc định 160), không dựng toàn bộ ~30k+ cửa.
-    X_val, y_val_norm = make_windows_1d(
-        signal, pm_eval, CONTEXT_LEN, PRED_LEN, max_windows=max_val_windows
-    )
-    _log.info(
-        "fit_calibration_quick: đã tạo %d cửa sổ val; chuẩn bị generate (%.1fs từ đầu bước)",
-        len(X_val),
-        time.perf_counter() - t0,
-    )
-
-    pred_val_norm = run_predict_windows(model, X_val, device)
-    y_val = y_val_norm * sigma_y + mu_y
-    pred_val = pred_val_norm * sigma_y + mu_y
-
-    lr = LinearRegression()
-    lr.fit(pred_val.reshape(-1, 1), y_val.reshape(-1))
-    a = float(lr.coef_[0])
-    b = float(lr.intercept_)
-    _log.info(
-        "fit_calibration_quick: xong hiệu chỉnh a=%.4f b=%.4f (tổng %.1fs)",
-        a,
-        b,
-        time.perf_counter() - t0,
-    )
+    X_all, y_all_norm = make_windows_1d(signal, pm_eval, CONTEXT_LEN, PRED_LEN)
+    n_total = len(X_all)
+    n_val = int(n_total * VAL_RATIO_IN_EVAL)
+    n_val = max(80, min(n_val, n_total - 80))
+    X_test = X_all[n_val:]
+    y_test_norm = y_all_norm[n_val:]
+    n_test_full = len(X_test)
+    if n_test_full == 0:
+        raise ValueError("Không có cửa sổ test sau khi chia val|test.")
+    if max_test_windows is not None and n_test_full > max_test_windows:
+        X_test = X_test[-max_test_windows:]
+        y_test_norm = y_test_norm[-max_test_windows:]
+    pred_test_norm = run_predict_windows(model, X_test, device)
+    y_test = y_test_norm * sigma_y + mu_y
+    pred_test = pred_test_norm * sigma_y + mu_y
+    metrics = compute_metrics(y_test, pred_test)
     return {
-        "calibration_a": a,
-        "calibration_b": b,
         "selected_features": selected_features,
-        "n_val_windows_used": len(X_val),
+        "metrics": metrics,
+        "n_test_windows_full": int(n_test_full),
+        "n_test_windows_used": len(X_test),
     }
 
 
@@ -463,13 +436,11 @@ def forecast_next_hours(
     device: str,
     alpha_pm: float,
     corr_threshold: float,
-    cal_a: float,
-    cal_b: float,
     forced_features: list[str] | None = None,
-) -> tuple[pd.DatetimeIndex, np.ndarray, np.ndarray]:
+) -> tuple[pd.DatetimeIndex, np.ndarray]:
     """
     Dự báo PRED_LEN giờ tiếp theo sau quan sát cuối: ngữ cảnh = CONTEXT_LEN giờ cuối của tín hiệu.
-    Trả về: mốc thời gian dự báo, giá trị đã hiệu chỉnh, giá trị thô.
+    Trả về: mốc thời gian dự báo, PM2.5 thô (µg/m³, đã đảo scale).
     """
     eval_scaled, pm_eval, _, mu_y, sigma_y, pm_corr = prepare_arrays(df)
     signal, _, _ = build_signal(
@@ -486,7 +457,6 @@ def forecast_next_hours(
     _log.info("forecast_next_hours: 1 cửa sổ ngữ cảnh → generate %d mốc", PRED_LEN)
     pred_norm = run_predict_windows(model, ctx, device, pred_len=PRED_LEN, batch_size=1)
     raw = pred_norm[0] * sigma_y + mu_y
-    cal = cal_a * raw + cal_b
     last_t = df["date"].iloc[-1]
     future_idx = pd.date_range(last_t + pd.Timedelta(hours=1), periods=PRED_LEN, freq="h")
-    return future_idx, cal, raw
+    return future_idx, raw

@@ -64,9 +64,15 @@ def load_forecast_cache() -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     try:
         raw_df = pd.read_csv(FORECAST_CACHE_FILE)
         raw_df["Thời gian"] = pd.to_datetime(raw_df["Thời gian"])
-        fc_df = raw_df.rename(columns={"Calibrated": "PM2.5 (μg/m³)"})[
-            ["Thời gian", "PM2.5 (μg/m³)"]
-        ]
+        if "PM2.5 (μg/m³)" in raw_df.columns:
+            fc_df = raw_df[["Thời gian", "PM2.5 (μg/m³)"]].copy()
+        elif "Raw" in raw_df.columns:
+            fc_df = raw_df[["Thời gian"]].copy()
+            fc_df["PM2.5 (μg/m³)"] = raw_df["Raw"].astype(float)
+        else:
+            fc_df = raw_df.rename(columns={"Calibrated": "PM2.5 (μg/m³)"})[
+                ["Thời gian", "PM2.5 (μg/m³)"]
+            ]
         meta = json.loads(FORECAST_CACHE_META.read_text(encoding="utf-8"))
     except Exception as e:
         raise RuntimeError(f"Không đọc hoặc không parse được cache dự báo: {e}") from e
@@ -199,14 +205,14 @@ def main() -> None:
         with st.spinner(
             "Đang cập nhật dự báo trên server (Open-Meteo, Time-MoE, LLM) — có thể vài phút..."
         ):
-            outcome, err = run_precompute_locked(160)
+            outcome, err = run_precompute_locked()
         if outcome == "error" and err:
             st.error(f"Precompute thất bại: {err}")
         elif outcome == "busy":
             st.info("Đang có tiến trình precompute khác (tab hoặc user khác) — tạm hiển thị cache hiện có.")
 
     try:
-        fc_df, cache_raw_df, cache_meta = load_forecast_cache()
+        fc_df, _, cache_meta = load_forecast_cache()
     except FileNotFoundError as e:
         st.error(str(e))
         st.stop()
@@ -240,12 +246,11 @@ def main() -> None:
         f"**Chế độ dữ liệu (cache):** `{cache_meta.get('data_mode', 'historical')}` — "
         "dự báo realtime: đặt `PM25_DATA_MODE=realtime` trong `.env`, rồi để trang precompute lại (hoặc `precompute_forecast.py --once`)."
     )
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3 = st.columns(3)
     m1.metric("Quan sát cuối (dataset)", str(cache_meta.get("dataset_last_time", "—")))
     model_id = str(cache_meta.get("model_id", "—"))
     m2.metric("Model", model_id[:32] + ("…" if len(model_id) > 32 else ""))
-    m3.metric("Cửa sổ val (precompute)", str(cache_meta.get("n_val_windows_used", "—")))
-    m4.metric("max_val_windows", str(cache_meta.get("max_val_windows_quick", "—")))
+    m3.metric("Chế độ dữ liệu", str(cache_meta.get("data_mode", "—")))
 
     st.divider()
     st.header("Dự báo 24 giờ tới (đã tính sẵn)")
@@ -269,24 +274,19 @@ def main() -> None:
         )
 
     llm_text_cached = cache_meta.get("llm_text", "")
-    raw = cache_raw_df["Raw"].to_numpy(dtype=float)
-    idx = fc_df["Thời gian"].to_numpy()
-    cal = fc_df["PM2.5 (μg/m³)"].to_numpy(dtype=float)
+    pm = fc_df["PM2.5 (μg/m³)"].to_numpy(dtype=float)
 
     render_hourly_forecast_strip(fc_df)
     render_forecast_chart(fc_df)
-    band, color = pm25_aqi_band_vn(float(np.mean(cal)))
+    band, color = pm25_aqi_band_vn(float(np.mean(pm)))
     st.markdown(
-        f"**Trung bình 24h (gợi ý):** {np.mean(cal):.1f} μg/m³ — "
+        f"**Trung bình 24h (gợi ý):** {np.mean(pm):.1f} μg/m³ — "
         f'<span style="color:{color}">**{band}**</span>',
         unsafe_allow_html=True,
     )
     render_warning_recommendations(fc_df, llm_text=llm_text_cached)
-    with st.expander("Bảng số & bản thô (chưa hiệu chỉnh)"):
-        st.dataframe(
-            pd.DataFrame({"Thời gian": idx, "Calibrated": cal, "Raw": raw}),
-            width="stretch",
-        )
+    with st.expander("Bảng số dự báo (thô)"):
+        st.dataframe(fc_df, width="stretch")
 
 
 if __name__ == "__main__":
